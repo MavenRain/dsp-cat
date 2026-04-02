@@ -1,0 +1,23 @@
+[package]
+name = "dsp-cat"
+version = "0.1.0"
+edition = "2024"
+description = "Composable DSP signal processing pipeline in RustHDL with comp-cat-rs categorical structure"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/MavenRain/dsp-cat"
+
+[dependencies]
+comp-cat-rs = "0.5"
+rust-hdl = "0.46"
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+proptest = "1"
+
+[[bench]]
+name = "fir_pipeline"
+harness = false
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
