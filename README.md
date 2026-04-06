@@ -1,7 +1,7 @@
 # dsp-cat
 
-Composable DSP signal processing pipeline in `RustHDL`, with
-categorical pipeline assembly driven by `comp-cat-rs`.
+Composable DSP signal processing pipeline with `hdl-cat` Mealy
+machines and categorical pipeline assembly driven by `comp-cat-rs`.
 
 ## Overview
 
@@ -18,8 +18,9 @@ This crate provides:
   free category graph (`comp_cat_rs::collapse::free_category`).
   Each block is an edge; the `interpret()` universal property composes
   them into a single `DspBlockDescriptor`.
-- **`RustHDL` modules**: `LogicBlock` implementations for every DSP
-  block, plus a composed `DspPipeline` that chains blocks.
+- **`hdl-cat` Sync machines**: Each DSP block is an IR graph built
+  with `HdlGraphBuilder`, returned as a `RawDspBlock`.  Pipelines
+  are composed via `compose_raw` (folded graph merging).
 - **`Io`-wrapped simulation**: Behavioral simulation with all side
   effects deferred inside `comp_cat_rs::effect::io::Io::suspend`.
 
@@ -29,27 +30,27 @@ This crate provides:
 Layer 1 (Pure)                    Layer 2 (HDL)
 --------------------              --------------------
 sample/                           hdl/
-  element.rs  (Sample newtype)      delay.rs      (circular buffer)
-  format.rs   (SampleFormat)        gain.rs       (1-cycle multiply)
-                                    decimator.rs  (keep every Nth)
-golden/                             interpolator.rs (zero insertion)
-  fir.rs      (convolution)         accumulator.rs  (running sum)
-  cic.rs      (integrate/decimate)
-  delay.rs    (prepend zeros)     hdl/fir/
-  gain.rs     (scale)               mac.rs        (multiply-accumulate)
-  decimator.rs (downsample)         tap_chain.rs  (shift register)
-  interpolator.rs (upsample)        fir_filter.rs (direct-form FIR)
+  element.rs  (Sample newtype)      common.rs     (DspIo, IR helpers)
+  format.rs   (SampleFormat)        raw.rs        (RawDspBlock, compose_raw)
+                                    accumulator.rs (running sum)
+golden/                             gain.rs       (widening multiply + shift)
+  fir.rs      (convolution)         delay.rs      (shift register chain)
+  cic.rs      (integrate/decimate)  decimator.rs  (keep every Nth)
+  delay.rs    (prepend zeros)       interpolator.rs (zero insertion FSM)
+  gain.rs     (scale)               fir.rs        (unrolled MAC chain)
+  decimator.rs (downsample)         cic.rs        (integrator + dec + comb)
+  interpolator.rs (upsample)        pipeline.rs   (descriptor -> RawDspBlock)
   accumulator.rs (prefix sum)
-  pipeline.rs (composed golden)   hdl/cic/
-                                    integrator.rs (running sum stage)
-graph/                              comb.rs       (first difference)
-  pipeline_graph.rs (N+1 V, N E)   cic_filter.rs (M int + dec + M comb)
+  pipeline.rs (composed golden)   sim/
+                                    runner.rs     (Io-wrapped sim)
+graph/
+  pipeline_graph.rs (N+1 V, N E)
   fir_graph.rs (6V, 7E FSM)
-  cic_graph.rs (7V, 8E FSM)      hdl/
-                                    pipeline.rs   (composed chain)
+  cic_graph.rs (7V, 8E FSM)
+
 interpret/
-  signal.rs     (BoundarySignal) sim/
-  descriptor.rs (DspBlockDescriptor) runner.rs   (Io-wrapped sim)
+  signal.rs     (BoundarySignal)
+  descriptor.rs (DspBlockDescriptor)
   morphism.rs   (GraphMorphism)
 
 composition/
@@ -58,24 +59,31 @@ composition/
 ```
 
 **Layer 1** is pure: zero `mut`, combinators only, comp-cat-rs effects.
-**Layer 2** quarantines `mut` inside `RustHDL`'s `Logic::update` methods
-and `Io::suspend` closures at the simulation boundary.
+**Layer 2** builds `hdl-cat` IR graphs via the functional
+`HdlGraphBuilder`.  All construction is pure; `mut` is confined to
+`Io::suspend` closures at the simulation boundary.
 
 The bridge between layers is the `interpret()` universal property of the
 free category: it maps the abstract pipeline graph into concrete block
-descriptors, which Layer 2 materializes into `RustHDL` modules.
+descriptors, which Layer 2 materializes into `hdl-cat` `Sync` machines
+via `build_pipeline`.
 
 ## DSP Blocks
 
-| Block | Golden model | HDL | Latency |
+| Block | Golden model | HDL constructor | Latency |
 |---|---|---|---|
-| FIR filter | `fir_convolve` | `FirFilterHdl` | N taps |
-| CIC filter | `cic_decimate` / `cic_interpolate` | `CicFilterHdl` | 2M+1 cycles |
-| Delay line | `delay_line` | `DelayLineHdl` | depth cycles |
-| Gain | `apply_gain` | `GainHdl` | 1 cycle |
-| Decimator | `decimate` | `DecimatorHdl` | 1 cycle |
-| Interpolator | `interpolate` | `InterpolatorHdl` | 1 cycle |
-| Accumulator | `accumulate` | `AccumulatorHdl` | 1 cycle |
+| FIR filter | `fir_convolve` | `build_fir` | combinational |
+| CIC filter | `cic_decimate` / `cic_interpolate` | `build_cic` | combinational |
+| Delay line | `delay_line` | `build_delay` | depth cycles |
+| Gain | `apply_gain` | `build_gain` | 1 cycle |
+| Decimator | `decimate` | `build_decimator` | combinational |
+| Interpolator | `interpolate` | `build_interpolator` | multi-cycle FSM |
+| Accumulator | `accumulate` | `build_accumulator` | 1 cycle |
+
+Every HDL constructor returns a `RawDspBlock` containing an IR graph,
+wire layout, and initial state.  Pipelines are assembled by folding
+blocks with `compose_raw`, which replicates `hdl-cat`'s
+`compose_sync` graph-merge logic at the raw level.
 
 ## Usage
 
@@ -131,6 +139,19 @@ let config = SimConfig::new(vec![Sample::new(10)], desc);
 let result = simulate_pipeline(config).run().ok();
 ```
 
+```rust
+use dsp_cat::hdl::pipeline::build_pipeline;
+use dsp_cat::interpret::descriptor::DspBlockDescriptor;
+use dsp_cat::interpret::signal::{BlockIndex, GainCoefficient, DelayDepth};
+
+// Build an hdl-cat IR graph from a descriptor
+let desc = DspBlockDescriptor::gain(BlockIndex::new(0), GainCoefficient::new(3))
+    .compose(DspBlockDescriptor::delay(BlockIndex::new(1), DelayDepth::new(2)));
+let raw_block = build_pipeline(&desc);
+// raw_block contains the merged IR graph, wire layout, and initial state
+// suitable for hdl-cat Testbench simulation or Verilog emission.
+```
+
 ## comp-cat-rs Integration
 
 | comp-cat-rs concept | dsp-cat mapping |
@@ -153,20 +174,20 @@ cargo doc --no-deps --open
 
 ## Testing
 
-118 tests across four levels:
+146 tests across four levels:
 
-- **Unit tests** (90): sample arithmetic, descriptor composition,
+- **Unit tests** (118): sample arithmetic, descriptor composition,
   graph connectivity, golden model properties, interpretation
-  correctness, pipeline construction.
-- **Integration tests** (11): golden model vs simulation agreement,
+  correctness, pipeline construction, IR graph structure.
+- **Integration tests** (7): golden model vs simulation agreement,
   pipeline composition via free category.
+- **Pipeline composition tests** (4): free category cascade and
+  interpretation properties.
 - **Doctests** (17): all public API examples.
-- **Benchmarks**: FIR pipeline via `criterion`.
 
 ```sh
 cargo test          # all unit + integration tests
 cargo test --doc    # doctests
-cargo bench         # criterion benchmarks
 ```
 
 ## License

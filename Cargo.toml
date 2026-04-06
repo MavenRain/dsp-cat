@@ -2,13 +2,13 @@
 name = "dsp-cat"
 version = "0.1.0"
 edition = "2024"
-description = "Composable DSP signal processing pipeline in RustHDL with comp-cat-rs categorical structure"
+description = "Composable DSP signal processing pipeline with hdl-cat and comp-cat-rs categorical structure"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/MavenRain/dsp-cat"
 
 [dependencies]
 comp-cat-rs = "0.5"
-rust-hdl = "0.46"
+hdl-cat = "0.1"
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }

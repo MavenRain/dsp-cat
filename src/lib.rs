@@ -13,10 +13,10 @@
 //!   models ([`golden`]), free category graphs ([`graph`]), and
 //!   pipeline interpretation ([`interpret`]).  No mutation.
 //!
-//! - **Layer 2 (HDL)**: `RustHDL` [`LogicBlock`](rust_hdl::prelude::LogicBlock)
-//!   implementations ([`hdl`]) with `mut` quarantined to
-//!   `Logic::update` methods, and behavioral simulation ([`sim`])
-//!   wrapped in [`Io`](comp_cat_rs::effect::io::Io).
+//! - **Layer 2 (HDL)**: [`hdl_cat`] `Sync` Mealy machine
+//!   implementations ([`hdl`]) built from pure IR graphs, and
+//!   cycle-accurate simulation ([`sim`]) wrapped in
+//!   [`Io`](comp_cat_rs::effect::io::Io).
 
 pub mod composition;
 pub mod error;

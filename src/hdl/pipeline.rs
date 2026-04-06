@@ -1,301 +1,114 @@
-//! Composed DSP pipeline HDL module.
+//! Composed DSP pipeline built from a [`DspBlockDescriptor`].
 //!
-//! Chains multiple DSP blocks by wiring the output of block k
-//! to the input of block k+1, following the same pattern as
-//! `NttPipeline` in goldilocks-ntt-hdl.
+//! Recursively walks the descriptor tree, constructs a
+//! [`RawDspBlock`] for each leaf, and folds them with
+//! [`compose_raw`] into a single combined IR graph.
 
-use rust_hdl::prelude::*;
-
-use crate::hdl::accumulator::AccumulatorHdl;
-use crate::hdl::cic::cic_filter::CicFilterHdl;
-use crate::hdl::common::{i32_to_bits, SAMPLE_WIDTH};
-use crate::hdl::decimator::DecimatorHdl;
-use crate::hdl::delay::DelayLineHdl;
-use crate::hdl::fir::fir_filter::FirFilterHdl;
-use crate::hdl::gain::GainHdl;
-use crate::hdl::interpolator::InterpolatorHdl;
+use crate::error::Error;
+use crate::hdl::accumulator::build_accumulator;
+use crate::hdl::cic::build_cic;
+use crate::hdl::decimator::build_decimator;
+use crate::hdl::delay::build_delay;
+use crate::hdl::fir::build_fir;
+use crate::hdl::gain::build_gain;
+use crate::hdl::interpolator::build_interpolator;
+use crate::hdl::raw::{compose_raw, identity_raw, RawDspBlock};
 use crate::interpret::descriptor::DspBlockDescriptor;
 
-/// A single DSP block, type-erased for pipeline composition.
-#[derive(Clone, Debug)]
-enum DspBlock {
-    Delay(DelayLineHdl),
-    Gain(GainHdl),
-    Decimator(DecimatorHdl),
-    Interpolator(InterpolatorHdl),
-    Accumulator(AccumulatorHdl),
-    Fir(FirFilterHdl),
-    Cic(CicFilterHdl),
-}
-
-/// Composed DSP pipeline.
+/// Build a [`RawDspBlock`] from a [`DspBlockDescriptor`].
 ///
-/// Built from a [`DspBlockDescriptor`] via [`DspPipeline::from_descriptor`].
-#[derive(Clone, Debug)]
-pub struct DspPipeline {
-    /// Clock input.
-    pub clock: Signal<In, Clock>,
-    /// Sample input.
-    pub data_in: Signal<In, Bits<SAMPLE_WIDTH>>,
-    /// Input valid strobe.
-    pub valid_in: Signal<In, Bit>,
-    /// Pipeline output.
-    pub data_out: Signal<Out, Bits<SAMPLE_WIDTH>>,
-    /// Output valid strobe.
-    pub valid_out: Signal<Out, Bit>,
-    blocks: Vec<DspBlock>,
-}
+/// Recursively flattens composed descriptors and chains the
+/// resulting blocks via [`compose_raw`].  An `Identity` descriptor
+/// produces a passthrough block with no state.
+///
+/// # Errors
+///
+/// Propagates errors from individual block constructors or
+/// from graph composition.
+pub fn build_pipeline(desc: &DspBlockDescriptor) -> Result<RawDspBlock, Error> {
+    match desc {
+        DspBlockDescriptor::Identity => identity_raw(),
 
-impl DspPipeline {
-    /// Build a pipeline from a block descriptor.
-    ///
-    /// Flattens composed descriptors into a linear chain.
-    #[must_use]
-    pub fn from_descriptor(descriptor: &DspBlockDescriptor) -> Self {
-        let blocks = Self::flatten_descriptor(descriptor);
-        Self {
-            clock: Signal::default(),
-            data_in: Signal::default(),
-            valid_in: Signal::default(),
-            data_out: Signal::default(),
-            valid_out: Signal::default(),
-            blocks,
+        DspBlockDescriptor::Delay { depth, .. } => build_delay(depth.value()),
+
+        DspBlockDescriptor::Gain {
+            coefficient, shift, ..
+        } => build_gain(coefficient.value(), *shift),
+
+        DspBlockDescriptor::Decimator { factor, .. } => {
+            build_decimator(factor.value())
         }
-    }
 
-    fn flatten_descriptor(desc: &DspBlockDescriptor) -> Vec<DspBlock> {
-        match desc {
-            DspBlockDescriptor::Identity => vec![],
-            DspBlockDescriptor::Delay { depth, .. } => {
-                vec![DspBlock::Delay(DelayLineHdl::new(depth.value()))]
-            }
-            DspBlockDescriptor::Gain {
-                coefficient, shift, ..
-            } => vec![DspBlock::Gain(GainHdl::new(coefficient.value(), *shift))],
-            DspBlockDescriptor::Decimator { factor, .. } => {
-                vec![DspBlock::Decimator(DecimatorHdl::new(factor.value()))]
-            }
-            DspBlockDescriptor::Interpolator { factor, .. } => {
-                vec![DspBlock::Interpolator(InterpolatorHdl::new(factor.value()))]
-            }
-            DspBlockDescriptor::Accumulator { .. } => {
-                vec![DspBlock::Accumulator(AccumulatorHdl::default())]
-            }
-            DspBlockDescriptor::Fir {
-                coefficients,
-                frac_bits,
-                ..
-            } => {
-                #[allow(clippy::cast_possible_truncation)]
-                let shift = frac_bits.value() as u32;
-                vec![DspBlock::Fir(FirFilterHdl::new(coefficients, shift))]
-            }
-            DspBlockDescriptor::Cic {
-                order, rate_factor, ..
-            } => vec![DspBlock::Cic(CicFilterHdl::new(
-                order.value(),
-                rate_factor.value(),
-            ))],
-            DspBlockDescriptor::Composed(blocks) => {
-                blocks.iter().flat_map(Self::flatten_descriptor).collect()
-            }
+        DspBlockDescriptor::Interpolator { factor, .. } => {
+            build_interpolator(factor.value())
+        }
+
+        DspBlockDescriptor::Accumulator { .. } => build_accumulator(),
+
+        DspBlockDescriptor::Fir {
+            coefficients,
+            frac_bits,
+            ..
+        } => {
+            #[allow(clippy::cast_possible_truncation)]
+            let shift = frac_bits.value() as u32;
+            let coeff_values: Vec<i32> = coefficients.iter().map(|s| s.value()).collect();
+            build_fir(&coeff_values, shift)
+        }
+
+        DspBlockDescriptor::Cic {
+            order, rate_factor, ..
+        } => build_cic(order.value(), rate_factor.value()),
+
+        DspBlockDescriptor::Composed(blocks) => {
+            blocks
+                .iter()
+                .try_fold(identity_raw()?, |acc, b| {
+                    build_pipeline(b).and_then(|block| compose_raw(acc, block))
+                })
         }
     }
 }
 
-impl Default for DspPipeline {
-    fn default() -> Self {
-        Self::from_descriptor(&DspBlockDescriptor::Identity)
-    }
-}
+#[cfg(test)]
+mod tests {
+    use super::build_pipeline;
+    use crate::interpret::descriptor::DspBlockDescriptor;
+    use crate::interpret::signal::{
+        BlockIndex, DelayDepth, GainCoefficient, RateFactor,
+    };
 
-/// Helper: get `data_out` and `valid_out` from a block.
-fn block_outputs(block: &DspBlock) -> (Bits<SAMPLE_WIDTH>, bool) {
-    match block {
-        DspBlock::Delay(b) => (b.data_out.val(), b.valid_out.val()),
-        DspBlock::Gain(b) => (b.data_out.val(), b.valid_out.val()),
-        DspBlock::Decimator(b) => (b.data_out.val(), b.valid_out.val()),
-        DspBlock::Interpolator(b) => (b.data_out.val(), b.valid_out.val()),
-        DspBlock::Accumulator(b) => (b.data_out.val(), b.valid_out.val()),
-        DspBlock::Fir(b) => (b.data_out.val(), b.valid_out.val()),
-        DspBlock::Cic(b) => (b.data_out.val(), b.valid_out.val()),
-    }
-}
-
-/// Helper: set clock, `data_in`, `valid_in` on a block.
-fn set_block_inputs(
-    block: &mut DspBlock,
-    clock: Clock,
-    data: Bits<SAMPLE_WIDTH>,
-    valid: bool,
-) {
-    match block {
-        DspBlock::Delay(b) => {
-            b.clock.next = clock;
-            b.data_in.next = data;
-            b.valid_in.next = valid;
-        }
-        DspBlock::Gain(b) => {
-            b.clock.next = clock;
-            b.data_in.next = data;
-            b.valid_in.next = valid;
-        }
-        DspBlock::Decimator(b) => {
-            b.clock.next = clock;
-            b.data_in.next = data;
-            b.valid_in.next = valid;
-        }
-        DspBlock::Interpolator(b) => {
-            b.clock.next = clock;
-            b.data_in.next = data;
-            b.valid_in.next = valid;
-        }
-        DspBlock::Accumulator(b) => {
-            b.clock.next = clock;
-            b.data_in.next = data;
-            b.valid_in.next = valid;
-        }
-        DspBlock::Fir(b) => {
-            b.clock.next = clock;
-            b.data_in.next = data;
-            b.valid_in.next = valid;
-        }
-        DspBlock::Cic(b) => {
-            b.clock.next = clock;
-            b.data_in.next = data;
-            b.valid_in.next = valid;
-        }
-    }
-}
-
-/// Helper: call `connect_all` on a block variant.
-fn connect_block(block: &mut DspBlock) {
-    match block {
-        DspBlock::Delay(b) => b.connect_all(),
-        DspBlock::Gain(b) => b.connect_all(),
-        DspBlock::Decimator(b) => b.connect_all(),
-        DspBlock::Interpolator(b) => b.connect_all(),
-        DspBlock::Accumulator(b) => b.connect_all(),
-        DspBlock::Fir(b) => b.connect_all(),
-        DspBlock::Cic(b) => b.connect_all(),
-    }
-}
-
-/// Helper: call `update_all` on a block variant.
-fn update_block(block: &mut DspBlock) {
-    match block {
-        DspBlock::Delay(b) => b.update_all(),
-        DspBlock::Gain(b) => b.update_all(),
-        DspBlock::Decimator(b) => b.update_all(),
-        DspBlock::Interpolator(b) => b.update_all(),
-        DspBlock::Accumulator(b) => b.update_all(),
-        DspBlock::Fir(b) => b.update_all(),
-        DspBlock::Cic(b) => b.update_all(),
-    }
-}
-
-/// Helper: check if a block's outputs have changed.
-fn block_has_changed(block: &DspBlock) -> bool {
-    match block {
-        DspBlock::Delay(b) => b.has_changed(),
-        DspBlock::Gain(b) => b.has_changed(),
-        DspBlock::Decimator(b) => b.has_changed(),
-        DspBlock::Interpolator(b) => b.has_changed(),
-        DspBlock::Accumulator(b) => b.has_changed(),
-        DspBlock::Fir(b) => b.has_changed(),
-        DspBlock::Cic(b) => b.has_changed(),
-    }
-}
-
-/// Helper: accept a probe visitor into a block variant.
-fn accept_block(block: &DspBlock, name: &str, probe: &mut dyn Probe) {
-    match block {
-        DspBlock::Delay(b) => b.accept(name, probe),
-        DspBlock::Gain(b) => b.accept(name, probe),
-        DspBlock::Decimator(b) => b.accept(name, probe),
-        DspBlock::Interpolator(b) => b.accept(name, probe),
-        DspBlock::Accumulator(b) => b.accept(name, probe),
-        DspBlock::Fir(b) => b.accept(name, probe),
-        DspBlock::Cic(b) => b.accept(name, probe),
-    }
-}
-
-impl Logic for DspPipeline {
-    fn update(&mut self) {
-        let n = self.blocks.len();
-
-        if n == 0 {
-            self.data_out.next = self.data_in.val();
-            self.valid_out.next = self.valid_in.val();
-        } else {
-            // Collect intermediate outputs (borrow checker pattern from NttPipeline)
-            let intermediates: Vec<(Bits<SAMPLE_WIDTH>, bool)> =
-                self.blocks.iter().map(block_outputs).collect();
-
-            // Feed first block from pipeline input
-            if let Some(first) = self.blocks.first_mut() {
-                set_block_inputs(
-                    first,
-                    self.clock.val(),
-                    self.data_in.val(),
-                    self.valid_in.val(),
-                );
-            }
-
-            // Chain: output of block k-1 feeds input of block k
-            (1..n).for_each(|k| {
-                if let (Some((data, valid)), Some(block)) =
-                    (intermediates.get(k - 1), self.blocks.get_mut(k))
-                {
-                    set_block_inputs(block, self.clock.val(), *data, *valid);
-                }
-            });
-
-            // Drive pipeline output from last block
-            if let Some((data, valid)) = intermediates.last() {
-                self.data_out.next = *data;
-                self.valid_out.next = *valid;
-            } else {
-                self.data_out.next = i32_to_bits(0);
-                self.valid_out.next = false;
-            }
-        }
+    #[test]
+    fn identity_pipeline_has_no_state() -> Result<(), crate::error::Error> {
+        let block = build_pipeline(&DspBlockDescriptor::Identity)?;
+        assert_eq!(block.state_wire_count(), 0);
+        Ok(())
     }
 
-    fn connect(&mut self) {
-        self.data_out.connect();
-        self.valid_out.connect();
+    #[test]
+    fn gain_then_delay_composes() -> Result<(), crate::error::Error> {
+        let desc = DspBlockDescriptor::gain(
+            BlockIndex::new(0),
+            GainCoefficient::new(2),
+        )
+        .compose(DspBlockDescriptor::delay(
+            BlockIndex::new(1),
+            DelayDepth::new(1),
+        ));
+        let block = build_pipeline(&desc)?;
+        // Gain: 2 state wires.  Delay(1): 2 state wires.
+        assert_eq!(block.state_wire_count(), 4);
+        Ok(())
     }
 
-    fn hdl(&self) -> Verilog {
-        Verilog::Empty
-    }
-}
-
-impl Block for DspPipeline {
-    fn connect_all(&mut self) {
-        self.blocks.iter_mut().for_each(connect_block);
-        self.connect();
-    }
-
-    fn update_all(&mut self) {
-        self.blocks.iter_mut().for_each(update_block);
-        self.update();
-    }
-
-    fn has_changed(&self) -> bool {
-        self.data_out.changed()
-            || self.valid_out.changed()
-            || self.blocks.iter().any(block_has_changed)
-    }
-
-    fn accept(&self, name: &str, probe: &mut dyn Probe) {
-        probe.visit_start_scope(name, self);
-        self.blocks.iter().enumerate().for_each(|(i, block)| {
-            accept_block(block, &format!("block_{i}"), probe);
-        });
-        probe.visit_atom("data_out", &self.data_out);
-        probe.visit_atom("valid_out", &self.valid_out);
-        probe.visit_end_scope(name, self);
+    #[test]
+    fn decimator_pipeline() -> Result<(), crate::error::Error> {
+        let desc = DspBlockDescriptor::decimator(
+            BlockIndex::new(0),
+            RateFactor::new(4),
+        );
+        let block = build_pipeline(&desc)?;
+        assert_eq!(block.state_wire_count(), 1);
+        Ok(())
     }
 }

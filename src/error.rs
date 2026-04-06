@@ -43,6 +43,9 @@ pub enum Error {
 
     /// IO error (e.g., VCD file write).
     Io(std::io::Error),
+
+    /// hdl-cat hardware description or simulation error.
+    Hdl(hdl_cat::Error),
 }
 
 impl core::fmt::Display for Error {
@@ -68,6 +71,7 @@ impl core::fmt::Display for Error {
             }
             Self::EmptyPipeline => write!(f, "pipeline has no blocks"),
             Self::Io(e) => write!(f, "IO error: {e}"),
+            Self::Hdl(e) => write!(f, "HDL error: {e}"),
         }
     }
 }
@@ -77,6 +81,7 @@ impl std::error::Error for Error {
         match self {
             Self::Io(e) => Some(e),
             Self::Graph(e) => Some(e),
+            Self::Hdl(e) => Some(e),
             Self::Sample(_)
             | Self::Fir(_)
             | Self::Cic(_)
@@ -97,5 +102,11 @@ impl From<std::io::Error> for Error {
 impl From<FreeCategoryError> for Error {
     fn from(e: FreeCategoryError) -> Self {
         Self::Graph(e)
+    }
+}
+
+impl From<hdl_cat::Error> for Error {
+    fn from(e: hdl_cat::Error) -> Self {
+        Self::Hdl(e)
     }
 }

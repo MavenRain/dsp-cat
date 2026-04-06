@@ -1,7 +1,8 @@
-//! Behavioral simulation wrapped in [`Io`](comp_cat_rs::effect::io::Io).
+//! Simulation wrapped in [`Io`](comp_cat_rs::effect::io::Io).
 //!
-//! The simulation executes the golden model inside `Io::suspend`,
+//! The golden-model simulation executes inside `Io::suspend`,
 //! keeping the outer interface pure.  Call `run()` only at the
-//! outermost boundary.
+//! outermost boundary.  The [`hdl_cat`] `Testbench` path is
+//! available via [`crate::hdl::pipeline::build_pipeline`].
 
 pub mod runner;
